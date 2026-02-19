@@ -1,0 +1,347 @@
+from __future__ import annotations
+
+from urllib.parse import quote
+import time
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from pathlib import Path
+from typing import Dict, Tuple, List, Optional
+
+from django.core.management.base import BaseCommand
+from django.db import transaction
+from django.conf import settings
+
+import pandas as pd
+from tqdm import tqdm
+
+from birds.models import Bird
+
+
+from django.core.management.base import BaseCommand
+from django.db import transaction
+from django.conf import settings
+
+import pandas as pd
+from tqdm import tqdm
+
+from birds.models import Bird
+
+
+WIKI_SUMMARY_API = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+WIKIDATA_SEARCH_API = "https://www.wikidata.org/w/api.php"
+WIKIDATA_GET_API    = "https://www.wikidata.org/w/api.php"
+COMMONS_FILE_PATH   = "https://commons.wikimedia.org/wiki/Special:FilePath/{filename}"
+
+# ---------- Config ----------
+# Put a contact email or URL where you can be reached (Wikipedia policy)
+DEFAULT_UA = getattr(
+    settings,
+    "ENRICH_USER_AGENT",
+    "BirdRekog/1.0 (+mailto:you@example.com)"
+)
+
+# Build a single session with retries + UA
+def _build_session(user_agent: str) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": user_agent,
+        "Accept": "application/json",
+    })
+    retry = Retry(
+        total=5,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+SESSION = _build_session(DEFAULT_UA)
+
+WIKI_SUMMARY_API = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+COMMONS_FILE_PATH = "https://commons.wikimedia.org/wiki/Special:FilePath/{filename}"
+
+
+# --------- Wikidata helpers ---------
+def wd_search_binomial(binomial: str) -> Optional[str]:
+    try:
+        params = {
+            "action": "wbsearchentities",
+            "search": binomial,
+            "language": "en",
+            "format": "json",
+            "type": "item",
+            "limit": 1,
+        }
+        r = SESSION.get(WIKIDATA_API, params=params, timeout=20)
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+        if data.get("search"):
+            return data["search"][0]["id"]
+    except Exception:
+        return None
+    return None
+
+def wd_get_property_labels(qid: str, property_ids: List[str]) -> Dict[str, str]:
+    """Get labels for specific Wikidata properties (e.g., P141 for habitat, P2078 for diet)."""
+    try:
+        params = {
+            "action": "wbgetentities",
+            "ids": qid,
+            "props": "claims",
+            "languages": "en",
+            "format": "json",
+        }
+        r = SESSION.get(WIKIDATA_API, params=params, timeout=20)
+        if r.status_code >= 400:
+            return {}
+        data = r.json()
+        ent = data.get("entities", {}).get(qid, {})
+        claims = ent.get("claims", {})
+        
+        result = {}
+        for prop_id in property_ids:
+            if prop_id not in claims:
+                continue
+            # Get the first value (most common)
+            snak = claims[prop_id][0]
+            mainsnak = snak.get("mainsnak", {})
+            if mainsnak.get("datatype") == "wikibase-item":
+                # It's a reference to another Wikidata item
+                datavalue = mainsnak.get("datavalue", {})
+                item_id = datavalue.get("value", {}).get("id")
+                if item_id:
+                    # Get the label for this item
+                    label_params = {
+                        "action": "wbgetentities",
+                        "ids": item_id,
+                        "props": "labels",
+                        "languages": "en",
+                        "format": "json",
+                    }
+                    label_r = SESSION.get(WIKIDATA_API, params=label_params, timeout=20)
+                    if label_r.status_code == 200:
+                        label_data = label_r.json()
+                        label = label_data.get("entities", {}).get(item_id, {}).get("labels", {}).get("en", {}).get("value")
+                        if label:
+                            result[prop_id] = label
+            elif mainsnak.get("datatype") == "monolingualtext":
+                # Direct text value
+                datavalue = mainsnak.get("datavalue", {})
+                text = datavalue.get("value", {}).get("text")
+                if text:
+                    result[prop_id] = text
+        
+        return result
+    except Exception:
+        return {}
+
+def wd_get_images(qid: str, max_images: int = 3) -> List[Tuple[str, str]]:
+    try:
+        params = {
+            "action": "wbgetentities",
+            "ids": qid,
+            "props": "labels|claims",
+            "languages": "en",
+            "format": "json",
+        }
+        r = SESSION.get(WIKIDATA_API, params=params, timeout=20)
+        if r.status_code >= 400:
+            return []
+        data = r.json()
+        ent = data.get("entities", {}).get(qid, {})
+        claims = ent.get("claims", {})
+        images = []
+        if "P18" in claims:
+            for snak in claims["P18"][:max_images]:
+                mainsnak = snak.get("mainsnak", {})
+                datav = mainsnak.get("datavalue", {})
+                filename = datav.get("value")
+                if not filename:
+                    continue
+                url = COMMONS_FILE_PATH.format(filename=quote(filename))
+                credit = filename
+                images.append((url, credit))
+                if len(images) >= max_images:
+                    break
+        return images
+    except Exception:
+        return []
+
+# --------- Wikipedia helpers ---------
+def wiki_summary_for_title(title: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Return (display_title, extract, original_image_url) for a Wikipedia page title.
+    Returns (None, None, None) on 404/403/429 etc.
+    """
+    try:
+        url = WIKI_SUMMARY_API.format(title=quote(title))
+        r = SESSION.get(url, timeout=20)
+        # 404: page not found; 403/429: blocked or rate-limited — treat as unavailable
+        if r.status_code in (403, 404, 429):
+            return None, None, None
+        if r.status_code >= 400:
+            return None, None, None
+        j = r.json()
+        display_title = j.get("title")
+        extract = j.get("extract")
+        img = None
+        if isinstance(j.get("originalimage"), dict):
+            img = j["originalimage"].get("source")
+        elif isinstance(j.get("thumbnail"), dict):
+            img = j["thumbnail"].get("source")
+        return display_title, extract, img
+    except Exception:
+        return None, None, None
+
+    return display_title, extract, img
+
+# --------- CSV import ---------
+def apply_csv_enrichment(csv_path: Path) -> Tuple[int, int]:
+    """
+    CSV columns (case-insensitive, extras optional):
+      binomial, habitat, diet, notes, image_url_1, image_credit_1,
+      image_url_2, image_credit_2, image_url_3, image_credit_3,
+      wikipedia_title, wikipedia_url
+    """
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    if "binomial" not in df.columns:
+        raise ValueError("CSV must include a 'binomial' column (e.g., 'Sylvia communis').")
+
+    created, updated = 0, 0
+    with transaction.atomic():
+        for _, row in df.iterrows():
+            binomial = str(row["binomial"]).strip()
+            if not binomial:
+                continue
+            defaults: Dict[str, str] = {}
+            for col in [
+                "habitat","diet","notes",
+                "image_url_1","image_credit_1",
+                "image_url_2","image_credit_2",
+                "image_url_3","image_credit_3",
+                "wikipedia_title","wikipedia_url",
+            ]:
+                if col in df.columns and pd.notna(row[col]):
+                    defaults[col] = str(row[col]).strip()
+            obj, is_created = Bird.objects.update_or_create(
+                binomial=binomial,
+                defaults=defaults
+            )
+            if is_created:
+                created += 1
+            else:
+                updated += 1
+    return created, updated
+
+# --------- Wiki enrichment ---------
+def auto_enrich_from_wiki(limit: Optional[int] = None, sleep_secs: float = 0.6) -> Tuple[int, int]:
+    qs = Bird.objects.all().order_by("binomial")
+    if limit:
+        qs = qs[:limit]
+
+    updated, skipped = 0, 0
+    for bird in tqdm(qs, desc="Enriching"):
+        needs_notes = not bird.notes
+        needs_img1 = not bird.image_url_1
+        needs_prov = not bird.wikipedia_url or not bird.wikidata_qid
+        needs_habitat = not bird.habitat
+        needs_diet = not bird.diet
+
+        if not (needs_notes or needs_img1 or needs_prov or needs_habitat or needs_diet):
+            skipped += 1
+            continue
+
+        # 1) Wikipedia summary: try common name, then binomial
+        display_title, extract, page_img = wiki_summary_for_title(bird.english_cname) if bird.english_cname else (None, None, None)
+        if not display_title:
+            display_title, extract, page_img = wiki_summary_for_title(bird.binomial)
+
+        if display_title and not bird.wikipedia_title:
+            bird.wikipedia_title = display_title
+            bird.wikipedia_url = f"https://en.wikipedia.org/wiki/{quote(display_title.replace(' ', '_'))}"
+        if extract and needs_notes:
+            bird.notes = extract
+
+        # 2) Wikidata QID + images + habitat/diet (never crash)
+        if not bird.wikidata_qid:
+            qid = wd_search_binomial(bird.binomial)
+            if qid:
+                bird.wikidata_qid = qid
+
+        # Fetch habitat and diet from Wikidata
+        if bird.wikidata_qid:
+            # P141 = habitat, P2078 = diet (food)
+            properties = wd_get_property_labels(bird.wikidata_qid, ["P141", "P2078"])
+            if "P141" in properties and not bird.habitat:
+                bird.habitat = properties["P141"]
+            if "P2078" in properties and not bird.diet:
+                bird.diet = properties["P2078"]
+            # Also try P2079 (diet) as alternative
+            if not bird.diet:
+                alt_props = wd_get_property_labels(bird.wikidata_qid, ["P2079"])
+                if "P2079" in alt_props:
+                    bird.diet = alt_props["P2079"]
+
+        images = wd_get_images(bird.wikidata_qid, max_images=3) if bird.wikidata_qid else []
+        if not images and page_img:
+            images = [(page_img, f"Wikipedia — {bird.wikipedia_title or bird.english_cname or bird.binomial}")]
+
+        # Fill first empty slots only
+        slots = [
+            ("image_url_1", "image_credit_1"),
+            ("image_url_2", "image_credit_2"),
+            ("image_url_3", "image_credit_3"),
+        ]
+        img_i = 0
+        for url, credit in images:
+            while img_i < len(slots) and getattr(bird, slots[img_i][0]):
+                img_i += 1
+            if img_i >= len(slots):
+                break
+            url_field, credit_field = slots[img_i]
+            setattr(bird, url_field, url)
+            setattr(bird, credit_field, credit)
+            img_i += 1
+
+        bird.save()
+        updated += 1
+        time.sleep(sleep_secs)  # be polite
+
+    return updated, skipped
+
+
+class Command(BaseCommand):
+    help = "Enrich Bird records from a CSV and/or Wikipedia/Wikidata (summary + images)."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--from-csv", type=str, help="Path to CSV with extra fields to merge.")
+        parser.add_argument("--from-wiki", action="store_true", help="Fetch Wikipedia/Wikidata summary & images.")
+        parser.add_argument("--limit", type=int, default=None, help="Limit number of birds to enrich from wiki (for testing).")
+        parser.add_argument("--sleep", type=float, default=0.5, help="Seconds to sleep between wiki requests.")
+
+    def handle(self, *args, **opts):
+        csv_path = opts.get("from_csv")
+        from_wiki = bool(opts.get("from_wiki"))
+        limit = opts.get("limit")
+        sleep_secs = float(opts.get("sleep", 0.5))
+
+        if not csv_path and not from_wiki:
+            self.stdout.write(self.style.WARNING("Nothing to do. Use --from-csv and/or --from-wiki."))
+            return
+
+        if csv_path:
+            created, updated = apply_csv_enrichment(Path(csv_path))
+            self.stdout.write(self.style.SUCCESS(f"CSV merge done: created={created}, updated={updated}"))
+
+        if from_wiki:
+            upd, skipped = auto_enrich_from_wiki(limit=limit, sleep_secs=sleep_secs)
+            self.stdout.write(self.style.SUCCESS(f"Wikipedia/Wikidata enrichment: updated={upd}, skipped={skipped}"))
